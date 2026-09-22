@@ -1,0 +1,7 @@
+services:
+  audit:
+    build: .
+    image: drone-nfz-audit
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
