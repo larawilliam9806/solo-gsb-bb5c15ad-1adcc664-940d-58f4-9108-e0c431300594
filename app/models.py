@@ -1,10 +1,10 @@
 """请求 / 响应的数据模型（Pydantic v2）。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 def _ensure_utc(v: datetime) -> datetime:
@@ -135,3 +135,91 @@ class GeoJsonFeature(BaseModel):
 class GeoJsonFeatureCollection(BaseModel):
     type: Literal["FeatureCollection"] = "FeatureCollection"
     features: List[GeoJsonFeature]
+
+
+# ================================================================
+# 设备维护工单
+# ================================================================
+
+TicketStatus = Literal["open", "assigned", "in_progress", "resolved", "closed"]
+TicketPriority = Literal["low", "normal", "high", "urgent"]
+
+
+class TicketCreate(BaseModel):
+    """创建维护工单的请求体。"""
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "device_id": "drone-uav-007",
+            "description": "左前电机在悬停时异响，疑似轴承磨损",
+            "priority": "high",
+            "sla_hours": 24,
+            "idempotency_key": "ops-20260922-0001",
+        }
+    })
+
+    device_id: str = Field(..., min_length=1, description="设备标识")
+    description: str = Field(..., min_length=1, description="问题描述")
+    priority: TicketPriority = Field("normal", description="优先级")
+    sla_hours: float = Field(..., gt=0, description="SLA 时限（小时），必须为正数")
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        description="幂等键：相同键重复请求返回首次创建的工单，不会重复创建",
+    )
+
+
+class Ticket(BaseModel):
+    """维护工单。状态只能沿 open→assigned→in_progress→resolved→closed 前进。"""
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "id": "9f1c2a7e3b8d4f6a9c0e1d2b3a4c5d6e",
+            "device_id": "drone-uav-007",
+            "description": "左前电机在悬停时异响，疑似轴承磨损",
+            "priority": "high",
+            "sla_hours": 24.0,
+            "idempotency_key": "ops-20260922-0001",
+            "status": "open",
+            "created_at": "2026-09-22T08:00:00Z",
+            "assigned_at": None,
+            "in_progress_at": None,
+            "resolved_at": None,
+            "closed_at": None,
+            "sla_deadline": "2026-09-23T08:00:00Z",
+        }
+    })
+
+    id: str
+    device_id: str
+    description: str
+    priority: TicketPriority
+    sla_hours: float = Field(..., gt=0)
+    idempotency_key: str
+    status: TicketStatus
+    created_at: datetime
+    assigned_at: Optional[datetime] = None
+    in_progress_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+
+    @computed_field(description="SLA 截止时间 = created_at + sla_hours")  # type: ignore[prop-decorator]
+    @property
+    def sla_deadline(self) -> datetime:
+        return self.created_at + timedelta(hours=self.sla_hours)
+
+
+class TicketTransitionRequest(BaseModel):
+    """工单状态推进请求体：目标状态必须是当前状态的下一状态。"""
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"status": "assigned"}
+    })
+
+    status: TicketStatus = Field(..., description="要推进到的目标状态")
+
+
+class OverdueTicket(Ticket):
+    """逾期工单条目：除工单字段外附带逾期秒数。"""
+
+    overdue_seconds: float = Field(..., description="距 SLA 截止时间已超出的秒数（> 0）")
