@@ -135,3 +135,61 @@ class GeoJsonFeature(BaseModel):
 class GeoJsonFeatureCollection(BaseModel):
     type: Literal["FeatureCollection"] = "FeatureCollection"
     features: List[GeoJsonFeature]
+
+
+# ------------------------------------------------------------- 设备维护工单
+
+TicketPriority = Literal["low", "medium", "high", "critical"]
+TicketStatus = Literal["open", "assigned", "in_progress", "resolved", "closed"]
+
+
+class MaintenanceTicketCreate(BaseModel):
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "device_id": "drone-007",
+            "description": "左前电机起飞时异响，震动明显",
+            "priority": "high",
+            "sla_hours": 24,
+            "idempotency_key": "ticket-20260922-0001",
+        }
+    })
+
+    device_id: str = Field(..., min_length=1, description="设备标识")
+    description: str = Field(..., min_length=1, description="问题描述")
+    priority: TicketPriority = Field(..., description="优先级")
+    sla_hours: float = Field(
+        ..., gt=0, allow_inf_nan=False, description="SLA 时限（小时），必须为正有限数值"
+    )
+    idempotency_key: str = Field(
+        ..., min_length=1, description="幂等键；相同键重复提交返回首次创建的工单，不重复创建"
+    )
+
+
+class TicketTransitionRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"example": {"to": "assigned"}})
+
+    to: TicketStatus = Field(
+        ..., description="目标状态，只能推进到当前状态在状态机中的下一状态"
+    )
+
+
+class MaintenanceTicket(BaseModel):
+    id: int
+    device_id: str
+    description: str
+    priority: TicketPriority
+    sla_hours: float
+    idempotency_key: str
+    status: TicketStatus = Field(..., description="open→assigned→in_progress→resolved→closed")
+    created_at: datetime
+    sla_due_at: datetime = Field(..., description="created_at + sla_hours")
+    assigned_at: Optional[datetime] = None
+    in_progress_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+
+
+class OverdueMaintenanceTicket(MaintenanceTicket):
+    overdue_seconds: float = Field(
+        ..., description="逾期秒数（当前时间 - sla_due_at），逾期列表按其降序"
+    )

@@ -1,6 +1,6 @@
 # 无人机航迹禁飞区审计服务
 
-基于 FastAPI + Shapely 的航迹合规审计服务。输入按时间排序的航点序列与带生效时段、高度范围的 GeoJSON 禁飞区，输出按时间排序的违规区间。
+基于 FastAPI + Shapely 的航迹合规审计服务。输入按时间排序的航点序列与带生效时段、高度范围的 GeoJSON 禁飞区，输出按时间排序的违规区间。另内置设备维护工单模块（创建、状态流转、SLA 逾期查询）。
 
 ## 快速启动（单条命令，端口 8000）
 
@@ -206,6 +206,98 @@ pytest
 
 **响应 422**：校验规则与 `/audit` 相同（航点乱序、多边形非法、参数错误等），此外 `altitude_offset` 缺失或不是有限数值也返回 422。
 
+## 设备维护工单
+
+工单状态只能按 **`open → assigned → in_progress → resolved → closed`** 单向推进，每次只能推进到紧邻的下一状态，不能跳跃、回退；`closed` 为终态。进入 `resolved` 时写入 `resolved_at`，因此关闭（`closed`）时必然已存在 `resolved_at`。工单数据保存在进程内存中（重启清空），所有时间为 UTC。
+
+### POST /maintenance/tickets
+
+创建工单，返回状态码 **201**。
+
+**请求体**
+
+```json
+{
+  "device_id": "drone-007",
+  "description": "左前电机起飞时异响，震动明显",
+  "priority": "high",
+  "sla_hours": 24,
+  "idempotency_key": "ticket-20260922-0001"
+}
+```
+
+- `device_id` / `description` / `idempotency_key`：非空字符串。
+- `priority`：`low` / `medium` / `high` / `critical` 之一。
+- `sla_hours`：SLA 时限（小时），必须为正的有限数值（0、负数、NaN/Inf 返回 422）；`sla_due_at = created_at + sla_hours`。
+- `idempotency_key`：幂等键。**相同键重复提交不会重复创建**，而是返回首次创建的那张工单（状态码 **200**，即使第二次请求携带不同内容）；可用状态码区分新建（201）与幂等重放（200）。
+
+**响应 201**（重复键重放时为 200，响应体相同）
+
+```json
+{
+  "id": 1,
+  "device_id": "drone-007",
+  "description": "左前电机起飞时异响，震动明显",
+  "priority": "high",
+  "sla_hours": 24.0,
+  "idempotency_key": "ticket-20260922-0001",
+  "status": "open",
+  "created_at": "2026-09-22T10:00:00Z",
+  "sla_due_at": "2026-09-23T10:00:00Z",
+  "assigned_at": null,
+  "in_progress_at": null,
+  "resolved_at": null,
+  "closed_at": null
+}
+```
+
+### POST /maintenance/tickets/{id}/transition
+
+把工单推进到请求体指定的状态，必须恰好是当前状态的下一状态。
+
+```json
+{"to": "assigned"}
+```
+
+依次提交 `assigned` → `in_progress` → `resolved` → `closed` 完成全生命周期；每次转换写入对应的时间戳（`assigned_at` / `in_progress_at` / `resolved_at` / `closed_at`）。
+
+**响应 200**：返回更新后的完整工单。
+
+**错误**
+
+- `404`：工单 id 不存在；
+- `409`：非法转换（跳跃、回退）或工单已是 `closed` 终态，例如 `{"detail": "非法状态转换：open → in_progress；当前只能推进到 assigned"}`；
+- `422`：`to` 不是五种合法状态之一。
+
+### GET /maintenance/tickets/overdue
+
+返回**超过 SLA 且尚未关闭**的工单，按逾期时长（`overdue_seconds = 当前时间 - sla_due_at`，秒）**降序**排列（时长相同按 id 升序）。已关闭（`closed`）或尚未到 SLA 期限的工单不出现；无逾期工单时返回 `[]`。
+
+**响应 200**
+
+```json
+[
+  {
+    "id": 1,
+    "device_id": "drone-007",
+    "description": "左前电机起飞时异响，震动明显",
+    "priority": "high",
+    "sla_hours": 24.0,
+    "idempotency_key": "ticket-20260922-0001",
+    "status": "in_progress",
+    "created_at": "2026-09-20T10:00:00Z",
+    "sla_due_at": "2026-09-21T10:00:00Z",
+    "assigned_at": "2026-09-20T12:00:00Z",
+    "in_progress_at": "2026-09-20T13:00:00Z",
+    "resolved_at": null,
+    "closed_at": null,
+    "overdue_seconds": 122400.0
+  }
+]
+```
+
+恰好在 `sla_due_at` 时刻（`overdue_seconds = 0`）不算逾期。
+
 ## 判定规则
 
 对每一条**相邻航段**（而非仅航点）逐一审计。航段上任意点用分数 f ∈ [0,1] 表示，位置、时间、高度均为 f 的线性函数，因此三个条件各自对应一个 f 区间：
@@ -220,15 +312,17 @@ pytest
 
 ```
 app/
-  main.py           # FastAPI 入口与路由（/audit、/audit/geojson、/audit/counterfactual）
-  models.py         # 请求/响应模型与参数校验（含 GeoJSON、反事实响应模型）
+  main.py           # FastAPI 入口与路由（/audit、/audit/geojson、/audit/counterfactual、/maintenance/*）
+  models.py         # 请求/响应模型与参数校验（含 GeoJSON、反事实响应、维护工单模型）
   audit.py          # 核心审计算法（平面求交 + f 域三窗口求交 + 区间合并）
   geojson.py        # 违规区间 → GeoJSON FeatureCollection 转换
   counterfactual.py # 反事实审计（高度平移 + 两次审计结果按匹配键求差集）
+  maintenance.py    # 维护工单：线程安全内存存储、幂等键、状态机与 SLA 逾期判定
 tests/
   test_audit.py           # POST /audit
   test_geojson.py         # POST /audit/geojson
   test_counterfactual.py  # POST /audit/counterfactual
+  test_maintenance.py     # 维护工单创建/幂等/状态流转/逾期
 Dockerfile
 docker-compose.yml
 ```
